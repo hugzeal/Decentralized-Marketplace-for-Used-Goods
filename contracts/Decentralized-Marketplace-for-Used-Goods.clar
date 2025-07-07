@@ -164,3 +164,311 @@
         (ok true)
     )
 )
+(define-constant dispute-fee u200)
+(define-constant arbitrator-reward u100)
+
+(define-data-var next-dispute-id uint u1)
+
+(define-map Arbitrators
+    { arbitrator: principal }
+    {
+        active: bool,
+        reputation-score: uint,
+        disputes-resolved: uint,
+    }
+)
+
+(define-map Disputes
+    { id: uint }
+    {
+        listing-id: uint,
+        buyer: principal,
+        seller: principal,
+        arbitrator: principal,
+        reason: (string-ascii 256),
+        status: (string-ascii 20),
+        resolution: (string-ascii 20),
+        created-at: uint,
+    }
+)
+
+(define-public (register-arbitrator)
+    (begin
+        (map-set Arbitrators { arbitrator: tx-sender } {
+            active: true,
+            reputation-score: u100,
+            disputes-resolved: u0,
+        })
+        (ok true)
+    )
+)
+
+(define-public (create-dispute
+        (listing-id uint)
+        (reason (string-ascii 256))
+    )
+    (let (
+            (dispute-id (var-get next-dispute-id))
+            (escrow (unwrap! (map-get? Escrows { id: listing-id }) (err u20)))
+            (listing (unwrap! (map-get? Listings { id: listing-id }) (err u21)))
+        )
+        (asserts! (is-eq (get status escrow) "pending") (err u22))
+        (asserts! (is-eq tx-sender (get buyer escrow)) (err u23))
+        (try! (stx-transfer? dispute-fee tx-sender contract-owner))
+        (map-set Disputes { id: dispute-id } {
+            listing-id: listing-id,
+            buyer: (get buyer escrow),
+            seller: (get seller escrow),
+            arbitrator: contract-owner,
+            reason: reason,
+            status: "open",
+            resolution: "pending",
+            created-at: burn-block-height,
+        })
+        (map-set Escrows { id: listing-id } (merge escrow { status: "disputed" }))
+        (var-set next-dispute-id (+ dispute-id u1))
+        (ok dispute-id)
+    )
+)
+
+(define-public (assign-arbitrator
+        (dispute-id uint)
+        (arbitrator principal)
+    )
+    (let ((dispute (unwrap! (map-get? Disputes { id: dispute-id }) (err u24))))
+        (asserts! (is-eq tx-sender contract-owner) (err u25))
+        (asserts! (is-eq (get status dispute) "open") (err u26))
+        (asserts! (is-some (map-get? Arbitrators { arbitrator: arbitrator }))
+            (err u27)
+        )
+        (map-set Disputes { id: dispute-id }
+            (merge dispute {
+                arbitrator: arbitrator,
+                status: "assigned",
+            })
+        )
+        (ok true)
+    )
+)
+
+(define-public (resolve-dispute
+        (dispute-id uint)
+        (resolution (string-ascii 20))
+    )
+    (let (
+            (dispute (unwrap! (map-get? Disputes { id: dispute-id }) (err u28)))
+            (listing-id (get listing-id dispute))
+            (escrow (unwrap! (map-get? Escrows { id: listing-id }) (err u29)))
+            (listing (unwrap! (map-get? Listings { id: listing-id }) (err u30)))
+            (arbitrator-data (unwrap! (map-get? Arbitrators { arbitrator: tx-sender }) (err u31)))
+        )
+        (asserts! (is-eq tx-sender (get arbitrator dispute)) (err u32))
+        (asserts! (is-eq (get status dispute) "assigned") (err u33))
+        (asserts!
+            (or (is-eq resolution "buyer-wins") (is-eq resolution "seller-wins"))
+            (err u34)
+        )
+        (if (is-eq resolution "buyer-wins")
+            (try! (stx-transfer? (get amount escrow) contract-owner (get buyer escrow)))
+            (begin
+                (try! (stx-transfer? (- (get amount escrow) arbitrator-reward)
+                    contract-owner (get seller escrow)
+                ))
+                (try! (nft-transfer? used-goods-nft (get nft-id listing)
+                    (get seller listing) (get buyer escrow)
+                ))
+            )
+        )
+        (try! (stx-transfer? arbitrator-reward contract-owner tx-sender))
+        (map-set Disputes { id: dispute-id }
+            (merge dispute {
+                status: "resolved",
+                resolution: resolution,
+            })
+        )
+        (map-set Escrows { id: listing-id } (merge escrow { status: "resolved" }))
+        (map-set Listings { id: listing-id }
+            (merge listing { status: "completed" })
+        )
+        (map-set Arbitrators { arbitrator: tx-sender }
+            (merge arbitrator-data {
+                disputes-resolved: (+ (get disputes-resolved arbitrator-data) u1),
+                reputation-score: (+ (get reputation-score arbitrator-data) u10),
+            })
+        )
+        (ok true)
+    )
+)
+
+(define-read-only (get-dispute (dispute-id uint))
+    (ok (map-get? Disputes { id: dispute-id }))
+)
+
+(define-read-only (get-arbitrator (arbitrator principal))
+    (ok (map-get? Arbitrators { arbitrator: arbitrator }))
+)
+(define-map SellerProfiles
+    { seller: principal }
+    {
+        total-sales: uint,
+        total-rating-points: uint,
+        rating-count: uint,
+        average-rating: uint,
+        joined-at: uint,
+    }
+)
+
+(define-map TransactionRatings
+    { listing-id: uint }
+    {
+        buyer: principal,
+        seller: principal,
+        rating: uint,
+        review: (string-ascii 256),
+        rated-at: uint,
+    }
+)
+
+(define-map BuyerRatingHistory
+    {
+        buyer: principal,
+        listing-id: uint,
+    }
+    { has-rated: bool }
+)
+
+(define-public (initialize-seller-profile)
+    (let ((existing-profile (map-get? SellerProfiles { seller: tx-sender })))
+        (asserts! (is-none existing-profile) (err u40))
+        (map-set SellerProfiles { seller: tx-sender } {
+            total-sales: u0,
+            total-rating-points: u0,
+            rating-count: u0,
+            average-rating: u0,
+            joined-at: burn-block-height,
+        })
+        (ok true)
+    )
+)
+
+(define-public (rate-seller
+        (listing-id uint)
+        (rating uint)
+        (review (string-ascii 256))
+    )
+    (let (
+            (listing (unwrap! (map-get? Listings { id: listing-id }) (err u41)))
+            (escrow (unwrap! (map-get? Escrows { id: listing-id }) (err u42)))
+            (seller (get seller listing))
+            (seller-profile (unwrap! (map-get? SellerProfiles { seller: seller }) (err u43)))
+            (rating-history (map-get? BuyerRatingHistory {
+                buyer: tx-sender,
+                listing-id: listing-id,
+            }))
+        )
+        (asserts! (is-eq tx-sender (get buyer escrow)) (err u44))
+        (asserts! (is-eq (get status escrow) "completed") (err u45))
+        (asserts! (and (>= rating u1) (<= rating u5)) (err u46))
+        (asserts! (is-none rating-history) (err u47))
+        (let (
+                (new-rating-count (+ (get rating-count seller-profile) u1))
+                (new-total-points (+ (get total-rating-points seller-profile) rating))
+                (new-average (/ new-total-points new-rating-count))
+            )
+            (map-set TransactionRatings { listing-id: listing-id } {
+                buyer: tx-sender,
+                seller: seller,
+                rating: rating,
+                review: review,
+                rated-at: burn-block-height,
+            })
+            (map-set BuyerRatingHistory {
+                buyer: tx-sender,
+                listing-id: listing-id,
+            } { has-rated: true }
+            )
+            (map-set SellerProfiles { seller: seller } {
+                total-sales: (+ (get total-sales seller-profile) u1),
+                total-rating-points: new-total-points,
+                rating-count: new-rating-count,
+                average-rating: new-average,
+                joined-at: (get joined-at seller-profile),
+            })
+            (ok true)
+        )
+    )
+)
+
+(define-public (get-seller-listings (seller principal))
+    (ok (filter get-active-listings-for-seller
+        (list
+            u1             u2             u3             u4             u5
+            u6             u7             u8             u9             u10
+            u11             u12             u13             u14             u15
+            u16             u17             u18             u19             u20
+            u21             u22             u23             u24             u25
+            u26             u27             u28             u29             u30
+            u31             u32             u33             u34             u35
+            u36             u37             u38             u39             u40
+            u41             u42             u43             u44             u45
+            u46             u47             u48             u49             u50
+            u51             u52             u53             u54             u55
+            u56             u57             u58             u59             u60
+            u61             u62             u63             u64             u65
+            u66             u67             u68             u69             u70
+            u71             u72             u73             u74             u75
+            u76             u77             u78             u79             u80
+            u81             u82             u83             u84             u85
+            u86             u87             u88             u89             u90
+            u91             u92             u93             u94             u95
+            u96             u97             u98             u99             u100
+        )))
+)
+
+(define-private (get-active-listings-for-seller (listing-id uint))
+    (match (map-get? Listings { id: listing-id })
+        listing (is-eq (get status listing) "active")
+        false
+    )
+)
+
+(define-read-only (get-seller-profile (seller principal))
+    (ok (map-get? SellerProfiles { seller: seller }))
+)
+
+(define-read-only (get-transaction-rating (listing-id uint))
+    (ok (map-get? TransactionRatings { listing-id: listing-id }))
+)
+
+(define-read-only (has-buyer-rated
+        (buyer principal)
+        (listing-id uint)
+    )
+    (ok (map-get? BuyerRatingHistory {
+        buyer: buyer,
+        listing-id: listing-id,
+    }))
+)
+
+(define-read-only (get-seller-reputation-tier (seller principal))
+    (let ((profile (map-get? SellerProfiles { seller: seller })))
+        (match profile
+            seller-data (let (
+                    (avg-rating (get average-rating seller-data))
+                    (total-sales (get total-sales seller-data))
+                )
+                (if (and (>= avg-rating u4) (>= total-sales u50))
+                    (ok "platinum")
+                    (if (and (>= avg-rating u4) (>= total-sales u20))
+                        (ok "gold")
+                        (if (and (>= avg-rating u3) (>= total-sales u10))
+                            (ok "silver")
+                            (ok "bronze")
+                        )
+                    )
+                )
+            )
+            (ok "unrated")
+        )
+    )
+)

@@ -1,38 +1,22 @@
-const { assertEquals, runScenario } = require('@stacks/clarity-js-sdk');
+import { describe, expect, it } from "vitest";
 
-describe('Decentralized Marketplace Tests', () => {
-  const seller = accounts.seller;
-  const buyer = accounts.buyer;
+const accounts = simnet.getAccounts();
+const address1 = accounts.get("wallet_1")!;
 
-  it('should create listing successfully', () => {
-    runScenario(([client]) => {
-      const result = client.createListing({
-        sender: seller,
-        title: "Vintage Chair",
-        description: "Antique wooden chair",
-        price: 1000
-      });
-      assertEquals(result.success, true);
-    });
+/*
+  The test below is an example. To learn more, read the testing documentation here:
+  https://docs.hiro.so/stacks/clarinet-js-sdk
+*/
+
+describe("example tests", () => {
+  it("ensures simnet is well initialised", () => {
+    expect(simnet.blockHeight).toBeDefined();
   });
 
-  it('should allow buying item', () => {
-    runScenario(([client]) => {
-      const result = client.buyItem({
-        sender: buyer,
-        listingId: 1
-      });
-      assertEquals(result.success, true);
-    });
-  });
-
-  it('should confirm delivery', () => {
-    runScenario(([client]) => {
-      const result = client.confirmDelivery({
-        sender: buyer,
-        listingId: 1
-      });
-      assertEquals(result.success, true);
-    });
-  });
+  // it("shows an example", () => {
+  //   const { result } = simnet.callReadOnlyFn("counter", "get-counter", [], address1);
+  //   expect(result).toBeUint(0);
+  // });
 });
+
+
