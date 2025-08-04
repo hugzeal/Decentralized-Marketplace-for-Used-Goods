@@ -44,7 +44,9 @@
             (nft-id (var-get next-nft-id))
         )
         (asserts! (> price u0) (err u1))
-        (try! (stx-transfer? listing-fee tx-sender contract-owner))
+        (let ((fee (get-listing-fee-for-seller tx-sender)))
+            (try! (stx-transfer? fee tx-sender contract-owner))
+        )
         (try! (nft-mint? used-goods-nft nft-id tx-sender))
         (map-set Listings { id: listing-id } {
             seller: tx-sender,
@@ -166,8 +168,11 @@
 )
 (define-constant dispute-fee u200)
 (define-constant arbitrator-reward u100)
+(define-constant verification-fee u2000)
+(define-constant verified-listing-fee u500)
 
 (define-data-var next-dispute-id uint u1)
+(define-data-var next-verification-id uint u1)
 
 (define-map Arbitrators
     { arbitrator: principal }
@@ -189,6 +194,29 @@
         status: (string-ascii 20),
         resolution: (string-ascii 20),
         created-at: uint,
+    }
+)
+
+(define-map SellerVerifications
+    { seller: principal }
+    {
+        verification-level: (string-ascii 20),
+        verified-at: uint,
+        verification-id: uint,
+        documents-hash: (string-ascii 64),
+        status: (string-ascii 20),
+    }
+)
+
+(define-map VerificationRequests
+    { id: uint }
+    {
+        seller: principal,
+        requested-level: (string-ascii 20),
+        documents-hash: (string-ascii 64),
+        status: (string-ascii 20),
+        submitted-at: uint,
+        reviewed-at: uint,
     }
 )
 
@@ -471,4 +499,112 @@
             (ok "unrated")
         )
     )
+)
+
+(define-public (request-verification
+        (requested-level (string-ascii 20))
+        (documents-hash (string-ascii 64))
+    )
+    (let ((verification-id (var-get next-verification-id)))
+        (asserts!
+            (or
+                (is-eq requested-level "basic")
+                (is-eq requested-level "premium")
+            )
+            (err u50)
+        )
+        (asserts! (is-none (map-get? SellerVerifications { seller: tx-sender }))
+            (err u51)
+        )
+        (try! (stx-transfer? verification-fee tx-sender contract-owner))
+        (map-set VerificationRequests { id: verification-id } {
+            seller: tx-sender,
+            requested-level: requested-level,
+            documents-hash: documents-hash,
+            status: "pending",
+            submitted-at: burn-block-height,
+            reviewed-at: u0,
+        })
+        (var-set next-verification-id (+ verification-id u1))
+        (ok verification-id)
+    )
+)
+
+(define-public (approve-verification (request-id uint))
+    (let (
+            (request (unwrap! (map-get? VerificationRequests { id: request-id }) (err u52)))
+            (seller (get seller request))
+        )
+        (asserts! (is-eq tx-sender contract-owner) (err u53))
+        (asserts! (is-eq (get status request) "pending") (err u54))
+        (map-set SellerVerifications { seller: seller } {
+            verification-level: (get requested-level request),
+            verified-at: burn-block-height,
+            verification-id: request-id,
+            documents-hash: (get documents-hash request),
+            status: "verified",
+        })
+        (map-set VerificationRequests { id: request-id }
+            (merge request {
+                status: "approved",
+                reviewed-at: burn-block-height,
+            })
+        )
+        (ok true)
+    )
+)
+
+(define-public (reject-verification (request-id uint))
+    (let ((request (unwrap! (map-get? VerificationRequests { id: request-id }) (err u55))))
+        (asserts! (is-eq tx-sender contract-owner) (err u56))
+        (asserts! (is-eq (get status request) "pending") (err u57))
+        (map-set VerificationRequests { id: request-id }
+            (merge request {
+                status: "rejected",
+                reviewed-at: burn-block-height,
+            })
+        )
+        (ok true)
+    )
+)
+
+(define-read-only (get-listing-fee-for-seller (seller principal))
+    (let ((verification (map-get? SellerVerifications { seller: seller })))
+        (match verification
+            verified-data (if (is-eq (get status verified-data) "verified")
+                verified-listing-fee
+                listing-fee
+            )
+            listing-fee
+        )
+    )
+)
+
+(define-read-only (is-seller-verified (seller principal))
+    (let ((verification (map-get? SellerVerifications { seller: seller })))
+        (match verification
+            verified-data (is-eq (get status verified-data) "verified")
+            false
+        )
+    )
+)
+
+(define-read-only (get-seller-verification-level (seller principal))
+    (let ((verification (map-get? SellerVerifications { seller: seller })))
+        (match verification
+            verified-data (if (is-eq (get status verified-data) "verified")
+                (ok (some (get verification-level verified-data)))
+                (ok none)
+            )
+            (ok none)
+        )
+    )
+)
+
+(define-read-only (get-verification-request (request-id uint))
+    (ok (map-get? VerificationRequests { id: request-id }))
+)
+
+(define-read-only (get-seller-verification (seller principal))
+    (ok (map-get? SellerVerifications { seller: seller }))
 )
