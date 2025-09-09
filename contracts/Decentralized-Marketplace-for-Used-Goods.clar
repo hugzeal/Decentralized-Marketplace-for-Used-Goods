@@ -170,9 +170,13 @@
 (define-constant arbitrator-reward u100)
 (define-constant verification-fee u2000)
 (define-constant verified-listing-fee u500)
+(define-constant auction-fee u800)
+(define-constant min-bid-increment u100)
+(define-constant auction-extension-blocks u10)
 
 (define-data-var next-dispute-id uint u1)
 (define-data-var next-verification-id uint u1)
+(define-data-var next-auction-id uint u1)
 
 (define-map Arbitrators
     { arbitrator: principal }
@@ -217,6 +221,33 @@
         status: (string-ascii 20),
         submitted-at: uint,
         reviewed-at: uint,
+    }
+)
+
+(define-map Auctions
+    { id: uint }
+    {
+        seller: principal,
+        title: (string-ascii 50),
+        description: (string-ascii 256),
+        starting-price: uint,
+        current-bid: uint,
+        highest-bidder: principal,
+        end-block: uint,
+        status: (string-ascii 20),
+        nft-id: uint,
+    }
+)
+
+(define-map AuctionBids
+    {
+        auction-id: uint,
+        bidder: principal,
+    }
+    {
+        bid-amount: uint,
+        bid-block: uint,
+        refunded: bool,
     }
 )
 
@@ -607,4 +638,167 @@
 
 (define-read-only (get-seller-verification (seller principal))
     (ok (map-get? SellerVerifications { seller: seller }))
+)
+
+(define-public (create-auction
+        (title (string-ascii 50))
+        (description (string-ascii 256))
+        (starting-price uint)
+        (duration-blocks uint)
+    )
+    (let (
+            (auction-id (var-get next-auction-id))
+            (nft-id (var-get next-nft-id))
+            (end-block (+ burn-block-height duration-blocks))
+        )
+        (asserts! (> starting-price u0) (err u60))
+        (asserts! (> duration-blocks u0) (err u61))
+        (try! (stx-transfer? auction-fee tx-sender contract-owner))
+        (try! (nft-mint? used-goods-nft nft-id tx-sender))
+        (map-set Auctions { id: auction-id } {
+            seller: tx-sender,
+            title: title,
+            description: description,
+            starting-price: starting-price,
+            current-bid: u0,
+            highest-bidder: tx-sender,
+            end-block: end-block,
+            status: "active",
+            nft-id: nft-id,
+        })
+        (map-set NFTOwnership { id: nft-id } { owner: tx-sender })
+        (var-set next-auction-id (+ auction-id u1))
+        (var-set next-nft-id (+ nft-id u1))
+        (ok auction-id)
+    )
+)
+
+(define-public (place-bid
+        (auction-id uint)
+        (bid-amount uint)
+    )
+    (let (
+            (auction (unwrap! (map-get? Auctions { id: auction-id }) (err u62)))
+            (current-bid (get current-bid auction))
+            (highest-bidder (get highest-bidder auction))
+            (min-bid (if (is-eq current-bid u0)
+                (get starting-price auction)
+                (+ current-bid min-bid-increment)
+            ))
+        )
+        (asserts! (is-eq (get status auction) "active") (err u63))
+        (asserts! (< burn-block-height (get end-block auction)) (err u64))
+        (asserts! (not (is-eq tx-sender (get seller auction))) (err u65))
+        (asserts! (>= bid-amount min-bid) (err u66))
+        (try! (stx-transfer? bid-amount tx-sender contract-owner))
+        (if (> current-bid u0)
+            (try! (stx-transfer? current-bid contract-owner highest-bidder))
+            true
+        )
+        (let ((new-end-block (if (< (- (get end-block auction) burn-block-height)
+                    auction-extension-blocks
+                )
+                (+ burn-block-height auction-extension-blocks)
+                (get end-block auction)
+            )))
+            (map-set Auctions { id: auction-id }
+                (merge auction {
+                    current-bid: bid-amount,
+                    highest-bidder: tx-sender,
+                    end-block: new-end-block,
+                })
+            )
+        )
+        (map-set AuctionBids {
+            auction-id: auction-id,
+            bidder: tx-sender,
+        } {
+            bid-amount: bid-amount,
+            bid-block: burn-block-height,
+            refunded: false,
+        })
+        (ok true)
+    )
+)
+
+(define-public (finalize-auction (auction-id uint))
+    (let (
+            (auction (unwrap! (map-get? Auctions { id: auction-id }) (err u67)))
+            (current-bid (get current-bid auction))
+            (highest-bidder (get highest-bidder auction))
+            (seller (get seller auction))
+            (nft-id (get nft-id auction))
+        )
+        (asserts! (is-eq (get status auction) "active") (err u68))
+        (asserts! (>= burn-block-height (get end-block auction)) (err u69))
+        (if (> current-bid u0)
+            (begin
+                (try! (stx-transfer? (- current-bid escrow-fee) contract-owner seller))
+                (try! (stx-transfer? escrow-fee contract-owner contract-owner))
+                (try! (nft-transfer? used-goods-nft nft-id seller highest-bidder))
+                (map-set NFTOwnership { id: nft-id } { owner: highest-bidder })
+                (map-set Auctions { id: auction-id }
+                    (merge auction { status: "sold" })
+                )
+            )
+            (begin
+                (try! (nft-burn? used-goods-nft nft-id seller))
+                (map-set Auctions { id: auction-id }
+                    (merge auction { status: "unsold" })
+                )
+            )
+        )
+        (ok true)
+    )
+)
+
+(define-public (cancel-auction (auction-id uint))
+    (let ((auction (unwrap! (map-get? Auctions { id: auction-id }) (err u70))))
+        (asserts! (is-eq tx-sender (get seller auction)) (err u71))
+        (asserts! (is-eq (get status auction) "active") (err u72))
+        (asserts! (is-eq (get current-bid auction) u0) (err u73))
+        (try! (nft-burn? used-goods-nft (get nft-id auction) tx-sender))
+        (map-set Auctions { id: auction-id }
+            (merge auction { status: "cancelled" })
+        )
+        (ok true)
+    )
+)
+
+(define-read-only (get-auction (auction-id uint))
+    (ok (map-get? Auctions { id: auction-id }))
+)
+
+(define-read-only (get-auction-bid
+        (auction-id uint)
+        (bidder principal)
+    )
+    (ok (map-get? AuctionBids {
+        auction-id: auction-id,
+        bidder: bidder,
+    }))
+)
+
+(define-read-only (is-auction-active (auction-id uint))
+    (let ((auction (map-get? Auctions { id: auction-id })))
+        (match auction
+            auction-data (and
+                (is-eq (get status auction-data) "active")
+                (< burn-block-height (get end-block auction-data))
+            )
+            false
+        )
+    )
+)
+
+(define-read-only (get-auction-time-remaining (auction-id uint))
+    (let ((auction (map-get? Auctions { id: auction-id })))
+        (match auction
+            auction-data (if (>= burn-block-height (get end-block auction-data))
+                (ok u0)
+                (ok (- (get end-block auction-data) burn-block-height))
+            )
+            (err u74)
+        )
+    )
 )
