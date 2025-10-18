@@ -173,10 +173,12 @@
 (define-constant auction-fee u800)
 (define-constant min-bid-increment u100)
 (define-constant auction-extension-blocks u10)
+(define-constant offer-duration-blocks u144)
 
 (define-data-var next-dispute-id uint u1)
 (define-data-var next-verification-id uint u1)
 (define-data-var next-auction-id uint u1)
+(define-data-var next-offer-id uint u1)
 
 (define-map Arbitrators
     { arbitrator: principal }
@@ -249,6 +251,27 @@
         bid-block: uint,
         refunded: bool,
     }
+)
+
+(define-map PriceOffers
+    { id: uint }
+    {
+        listing-id: uint,
+        buyer: principal,
+        seller: principal,
+        offer-amount: uint,
+        status: (string-ascii 20),
+        created-at: uint,
+        expires-at: uint,
+    }
+)
+
+(define-map ListingOffers
+    {
+        listing-id: uint,
+        buyer: principal,
+    }
+    { offer-id: uint }
 )
 
 (define-public (register-arbitrator)
@@ -799,6 +822,138 @@
                 (ok (- (get end-block auction-data) burn-block-height))
             )
             (err u74)
+        )
+    )
+)
+
+(define-public (make-offer
+        (listing-id uint)
+        (offer-amount uint)
+    )
+    (let (
+            (offer-id (var-get next-offer-id))
+            (listing (unwrap! (map-get? Listings { id: listing-id }) (err u80)))
+            (seller (get seller listing))
+            (expires-at (+ burn-block-height offer-duration-blocks))
+        )
+        (asserts! (is-eq (get status listing) "active") (err u81))
+        (asserts! (not (is-eq tx-sender seller)) (err u82))
+        (asserts! (> offer-amount u0) (err u83))
+        (asserts! (< offer-amount (get price listing)) (err u84))
+        (asserts!
+            (is-none (map-get? ListingOffers {
+                listing-id: listing-id,
+                buyer: tx-sender,
+            }))
+            (err u85)
+        )
+        (map-set PriceOffers { id: offer-id } {
+            listing-id: listing-id,
+            buyer: tx-sender,
+            seller: seller,
+            offer-amount: offer-amount,
+            status: "pending",
+            created-at: burn-block-height,
+            expires-at: expires-at,
+        })
+        (map-set ListingOffers {
+            listing-id: listing-id,
+            buyer: tx-sender,
+        } { offer-id: offer-id }
+        )
+        (var-set next-offer-id (+ offer-id u1))
+        (ok offer-id)
+    )
+)
+
+(define-public (accept-offer (offer-id uint))
+    (let (
+            (offer (unwrap! (map-get? PriceOffers { id: offer-id }) (err u86)))
+            (listing-id (get listing-id offer))
+            (listing (unwrap! (map-get? Listings { id: listing-id }) (err u87)))
+            (buyer (get buyer offer))
+            (offer-amount (get offer-amount offer))
+        )
+        (asserts! (is-eq tx-sender (get seller offer)) (err u88))
+        (asserts! (is-eq (get status offer) "pending") (err u89))
+        (asserts! (< burn-block-height (get expires-at offer)) (err u90))
+        (asserts! (is-eq (get status listing) "active") (err u91))
+        (try! (stx-transfer? offer-amount buyer contract-owner))
+        (map-set Escrows { id: listing-id } {
+            buyer: buyer,
+            seller: tx-sender,
+            amount: offer-amount,
+            status: "pending",
+        })
+        (map-set Listings { id: listing-id }
+            (merge listing {
+                status: "in-escrow",
+                price: offer-amount,
+            })
+        )
+        (map-set PriceOffers { id: offer-id }
+            (merge offer { status: "accepted" })
+        )
+        (ok listing-id)
+    )
+)
+
+(define-public (reject-offer (offer-id uint))
+    (let ((offer (unwrap! (map-get? PriceOffers { id: offer-id }) (err u92))))
+        (asserts! (is-eq tx-sender (get seller offer)) (err u93))
+        (asserts! (is-eq (get status offer) "pending") (err u94))
+        (map-set PriceOffers { id: offer-id }
+            (merge offer { status: "rejected" })
+        )
+        (ok true)
+    )
+)
+
+(define-public (cancel-offer (offer-id uint))
+    (let ((offer (unwrap! (map-get? PriceOffers { id: offer-id }) (err u95))))
+        (asserts! (is-eq tx-sender (get buyer offer)) (err u96))
+        (asserts! (is-eq (get status offer) "pending") (err u97))
+        (map-set PriceOffers { id: offer-id }
+            (merge offer { status: "cancelled" })
+        )
+        (ok true)
+    )
+)
+
+(define-read-only (get-offer (offer-id uint))
+    (ok (map-get? PriceOffers { id: offer-id }))
+)
+
+(define-read-only (get-listing-offer
+        (listing-id uint)
+        (buyer principal)
+    )
+    (ok (map-get? ListingOffers {
+        listing-id: listing-id,
+        buyer: buyer,
+    }))
+)
+
+(define-read-only (is-offer-valid (offer-id uint))
+    (let ((offer (map-get? PriceOffers { id: offer-id })))
+        (match offer
+            offer-data (and
+                (is-eq (get status offer-data) "pending")
+                (< burn-block-height (get expires-at offer-data))
+            )
+            false
+        )
+    )
+)
+
+(define-read-only (get-offer-expiry (offer-id uint))
+    (let ((offer (map-get? PriceOffers { id: offer-id })))
+        (match offer
+            offer-data (if (>= burn-block-height (get expires-at offer-data))
+                (ok u0)
+                (ok (- (get expires-at offer-data) burn-block-height))
+            )
+            (err u98)
         )
     )
 )
