@@ -12,6 +12,7 @@
         price: uint,
         title: (string-ascii 50),
         description: (string-ascii 256),
+        category: (string-ascii 20),
         status: (string-ascii 20),
         nft-id: uint,
     }
@@ -53,6 +54,7 @@
             price: price,
             title: title,
             description: description,
+            category: "general",
             status: "active",
             nft-id: nft-id,
         })
@@ -166,6 +168,29 @@
         (ok true)
     )
 )
+
+(define-public (set-listing-category
+        (listing-id uint)
+        (category (string-ascii 20))
+    )
+    (let ((listing (unwrap! (map-get? Listings { id: listing-id }) (err u99))))
+        (asserts! (is-eq tx-sender (get seller listing)) (err u100))
+        (map-set Listings { id: listing-id }
+            (merge listing { category: category })
+        )
+        (ok true)
+    )
+)
+
+(define-read-only (get-listing-category (listing-id uint))
+    (let ((listing (map-get? Listings { id: listing-id })))
+        (match listing
+            listing-data (ok (some (get category listing-data)))
+            (ok none)
+        )
+    )
+)
+
 (define-constant dispute-fee u200)
 (define-constant arbitrator-reward u100)
 (define-constant verification-fee u2000)
